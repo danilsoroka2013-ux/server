@@ -3,7 +3,7 @@
 It forwards opaque ciphertext between exactly one owner and one guest. TLS terminates
 at the reverse proxy. End-to-end authentication/encryption must be done by clients.
 """
-import asyncio, json, os, re, time
+import asyncio, json, os, re, time, ipaddress
 from aiohttp import web, WSMsgType
 
 ROOM = re.compile(r'^[A-Za-z0-9_-]{43}$')  # 256-bit unguessable room identifier
@@ -16,15 +16,22 @@ rooms = {}
 async def health(request):
     return web.json_response({'ok': True, 'protocol': 1}, headers={'Cache-Control':'no-store'})
 
-async def peer_notice(ws, state):
+async def peer_notice(ws, state, ip=None):
     if ws and not ws.closed:
-        try: await ws.send_json({'type': state})
+        try: await ws.send_json({'type': state, **({'ip': ip} if ip else {})})
         except (ConnectionError, RuntimeError): pass
+
+def client_ip(request):
+    # Render edge currently supplies CF-Connecting-IP; never trust arbitrary X-Forwarded-For.
+    # This value is informational, not proof of identity. Proxy behavior can change.
+    candidate = request.headers.get('CF-Connecting-IP') if os.environ.get('RENDER') else request.remote
+    try: return str(ipaddress.ip_address(candidate))
+    except (ValueError, TypeError): return None
 
 async def socket(request):
     ws = web.WebSocketResponse(heartbeat=25, max_msg_size=MAX_WIRE, compress=False)
     await ws.prepare(request)
-    room_id = None; role = None; room = None
+    room_id = None; role = None; room = None; ip = client_ip(request)
     try:
         try: first = await asyncio.wait_for(ws.receive(), 10)
         except asyncio.TimeoutError: return ws
@@ -41,10 +48,11 @@ async def socket(request):
         if role in room:
             await ws.send_json({'type':'unavailable'});return ws
         room[role] = ws
+        ws._nara_ip = ip
         peerrole = 'guest' if role == 'owner' else 'owner'
-        await ws.send_json({'type':'joined'})
+        await ws.send_json({'type':'joined','ip':ip,'heartbeat':True})
         if peerrole in room:
-            await peer_notice(ws,'peer_up');await peer_notice(room[peerrole],'peer_up')
+            await peer_notice(ws,'peer_up',getattr(room[peerrole],'_nara_ip',None) if role=='owner' else None);await peer_notice(room[peerrole],'peer_up',ip if peerrole=='owner' else None)
         tokens=40.0; last=time.monotonic()
         while True:
             try: msg=await asyncio.wait_for(ws.receive(), IDLE_SECONDS)
@@ -56,6 +64,8 @@ async def socket(request):
             tokens-=1
             try: data=json.loads(msg.data)
             except (ValueError, TypeError): break
+            if data == {'type':'ping'}:
+                await ws.send_json({'type':'pong'});continue
             if not isinstance(data,dict) or set(data)!={'type','data'} or data.get('type')!='relay' or not isinstance(data.get('data'),str) or len(data['data'])<40 or len(data['data'])>MAX_WIRE-100 or not PAYLOAD.fullmatch(data['data']): break
             peer=room.get(peerrole)
             if peer is None or peer.closed:
@@ -75,8 +85,12 @@ async def socket(request):
         if not ws.closed: await ws.close()
     return ws
 
+async def my_ip(request):
+    return web.json_response({'ip':client_ip(request)},headers={'Access-Control-Allow-Origin':'*','Cache-Control':'no-store'})
+
 app=web.Application(client_max_size=MAX_WIRE)
 app.router.add_get('/health',health)
+app.router.add_get('/ip',my_ip)
 app.router.add_get('/relay',socket)
 if __name__ == '__main__':
     # Never log URLs or messages: room identifiers and ciphertext need not be retained.
